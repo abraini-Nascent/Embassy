@@ -19,6 +19,7 @@ public final class KqueueSelector: Selector {
     private let selectMaximumEvent: Int
     private let kqueue: Int32
     private var fileDescriptorMap: [Int32: SelectorKey] = [:]
+    private let accessQueue = DispatchQueue(label: "FileDescriptorMapAccessQueue", attributes: .concurrent)
 
     public init(selectMaximumEvent: Int = 1024) throws {
         kqueue = Darwin.kqueue()
@@ -38,74 +39,89 @@ public final class KqueueSelector: Selector {
         events: Set<IOEvent>,
         data: Any?
     ) throws -> SelectorKey {
-        // ensure the file descriptor doesn't exist already
-        guard fileDescriptorMap[fileDescriptor] == nil else {
-            throw Error.keyError(fileDescriptor: fileDescriptor)
-        }
-        let key = SelectorKey(fileDescriptor: fileDescriptor, events: events, data: data)
-        fileDescriptorMap[fileDescriptor] = key
-
-        var kevents: [Darwin.kevent] = []
-        for event in events {
-            let filter: Int16
-            switch event {
-            case .read:
-                filter = Int16(EVFILT_READ)
-            case .write:
-                filter = Int16(EVFILT_WRITE)
+        
+        var key: SelectorKey!
+        
+        // thread safe access to the fileDescriptorMap and kqueue
+        try accessQueue.sync(flags: .barrier) {
+            
+            // ensure the file descriptor doesn't exist already
+            guard fileDescriptorMap[fileDescriptor] == nil else {
+                throw Error.keyError(fileDescriptor: fileDescriptor)
             }
-            let kevent = Darwin.kevent(
-                ident: UInt(fileDescriptor),
-                filter: filter,
-                flags: UInt16(EV_ADD),
-                fflags: UInt32(0),
-                data: Int(0),
-                udata: nil
-            )
-            kevents.append(kevent)
-        }
+            key = SelectorKey(fileDescriptor: fileDescriptor, events: events, data: data)
+            fileDescriptorMap[fileDescriptor] = key
 
-        // register events to kqueue
-        guard kevents.withUnsafeMutableBufferPointer({ pointer in
-            kevent(kqueue, pointer.baseAddress, Int32(pointer.count), nil, Int32(0), nil) >= 0
-        }) else {
-            throw OSError.lastIOError()
+            var kevents: [Darwin.kevent] = []
+            for event in events {
+                let filter: Int16
+                switch event {
+                case .read:
+                    filter = Int16(EVFILT_READ)
+                case .write:
+                    filter = Int16(EVFILT_WRITE)
+                }
+                let kevent = Darwin.kevent(
+                    ident: UInt(fileDescriptor),
+                    filter: filter,
+                    flags: UInt16(EV_ADD),
+                    fflags: UInt32(0),
+                    data: Int(0),
+                    udata: nil
+                )
+                kevents.append(kevent)
+            }
+
+            // register events to kqueue
+            guard kevents.withUnsafeMutableBufferPointer({ pointer in
+                kevent(kqueue, pointer.baseAddress, Int32(pointer.count), nil, Int32(0), nil) >= 0
+            }) else {
+                throw OSError.lastIOError()
+            }
         }
         return key
     }
 
     @discardableResult
     public func unregister(_ fileDescriptor: Int32) throws -> SelectorKey {
-        // ensure the file descriptor exists
-        guard let key = fileDescriptorMap[fileDescriptor] else {
-            throw Error.keyError(fileDescriptor: fileDescriptor)
-        }
-        fileDescriptorMap.removeValue(forKey: fileDescriptor)
-        var kevents: [Darwin.kevent] = []
-        for event in key.events {
-            let filter: Int16
-            switch event {
-            case .read:
-                filter = Int16(EVFILT_READ)
-            case .write:
-                filter = Int16(EVFILT_WRITE)
+        
+        var key: SelectorKey!
+        
+        // thread safe access to the fileDescriptorMap and kqueue
+        try accessQueue.sync(flags: .barrier) {
+            
+            // ensure the file descriptor exists
+            guard fileDescriptorMap[fileDescriptor] != nil else {
+                throw Error.keyError(fileDescriptor: fileDescriptor)
             }
-            let kevent = Darwin.kevent(
-                ident: UInt(fileDescriptor),
-                filter: filter,
-                flags: UInt16(EV_DELETE),
-                fflags: UInt32(0),
-                data: Int(0),
-                udata: nil
-            )
-            kevents.append(kevent)
-        }
+            key = fileDescriptorMap[fileDescriptor]
+            fileDescriptorMap.removeValue(forKey: fileDescriptor)
+            var kevents: [Darwin.kevent] = []
+            for event in key.events {
+                let filter: Int16
+                switch event {
+                case .read:
+                    filter = Int16(EVFILT_READ)
+                case .write:
+                    filter = Int16(EVFILT_WRITE)
+                }
+                let kevent = Darwin.kevent(
+                    ident: UInt(fileDescriptor),
+                    filter: filter,
+                    flags: UInt16(EV_DELETE),
+                    fflags: UInt32(0),
+                    data: Int(0),
+                    udata: nil
+                )
+                kevents.append(kevent)
+            }
 
-        // unregister events from kqueue
-        guard kevents.withUnsafeMutableBufferPointer({ pointer in
-            kevent(kqueue, pointer.baseAddress, Int32(pointer.count), nil, Int32(0), nil) >= 0
-        }) else {
-            throw OSError.lastIOError()
+            // unregister events from kqueue
+            guard kevents.withUnsafeMutableBufferPointer({ pointer in
+                kevent(kqueue, pointer.baseAddress, Int32(pointer.count), nil, Int32(0), nil) >= 0
+            }) else {
+                throw OSError.lastIOError()
+            }
         }
         return key
     }
@@ -155,7 +171,12 @@ public final class KqueueSelector: Selector {
             }
             fileDescriptorIOEvents[fileDescriptor] = ioEvents
         }
-        let fdMap = fileDescriptorMap
+        
+        // thread safe access to the fileDescriptorMap
+        var fdMap: [Int32: SelectorKey]!
+        accessQueue.sync {
+            fdMap = fileDescriptorMap
+        }
         return fileDescriptorIOEvents.compactMap { [weak self] event in
             fdMap[event.0].map { ($0, event.1) } ?? nil
         }
@@ -163,7 +184,12 @@ public final class KqueueSelector: Selector {
 
     public subscript(fileDescriptor: Int32) -> SelectorKey? {
         get {
-            return fileDescriptorMap[fileDescriptor]
+            // thread safe access to the fileDescriptorMap
+            var key: SelectorKey?
+            accessQueue.sync {
+                key = fileDescriptorMap[fileDescriptor]
+            }
+            return key
         }
     }
 
